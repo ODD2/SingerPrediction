@@ -2,6 +2,7 @@ import os
 import csv
 import torch
 import pickle
+import random
 import logging
 import librosa
 import numpy as np
@@ -11,9 +12,11 @@ import torchaudio.functional as F
 
 from glob import glob
 from tqdm import tqdm
+from enum import IntEnum, auto
+import audiomentations as alb
 
 
-def cut_mute(spec, sample_rate, hop_size, onset_th=0.5, close_th=2):
+def cut_mute(spec, sample_rate, hop_size, onset_th=0.1, close_th=1):
     """
         onset_th: determine the valid interval for a signing segment.
         close_th: determine the maximum interval to concatenate between two signing segments.
@@ -82,6 +85,29 @@ class AudioMeta:
         self.path = path
 
 
+class SingerLabel(IntEnum):
+    aerosmith = 0
+    beatles = auto()
+    creedence_clearwater_revival = auto()
+    cure = auto()
+    dave_matthews_band = auto()
+    depeche_mode = auto()
+    fleetwood_mac = auto()
+    garth_brooks = auto()
+    green_day = auto()
+    led_zeppelin = auto()
+    madonna = auto()
+    metallica = auto()
+    prince = auto()
+    queen = auto()
+    radiohead = auto()
+    roxette = auto()
+    steely_dan = auto()
+    suzanne_vega = auto()
+    tori_amos = auto()
+    u2 = auto()
+
+
 class ArtistDataset():
     def __init__(
             self,
@@ -91,9 +117,9 @@ class ArtistDataset():
             duration,
             mono=True,
             n_fft=512,
-            onset_th=1,
-            close_th=0.5,
-            uni_sample_rate=16000,
+            onset_th=0.1,
+            close_th=1.0,
+            target_sr=16000,
     ):
         super().__init__()
         self.root_dir = root_dir
@@ -102,11 +128,31 @@ class ArtistDataset():
         self.duration = duration
         self.onset_th = onset_th
         self.close_th = close_th
-        self.uni_sample_rate = uni_sample_rate
+        self.target_sr = target_sr
         self.audio_name = audio_name
         self.mono = mono
 
         self.load_audio_meta()
+
+        self.augmentations = alb.Compose([
+            alb.TanhDistortion(),
+            alb.AddGaussianNoise(),
+            alb.TimeStretch(),
+            alb.Reverse(),
+            alb.Gain(),
+            alb.Mp3Compression(
+                min_bitrate=8,
+                max_bitrate=32
+            ),
+            alb.GainTransition(
+                min_gain_db=-6,
+                max_gain_db=6,
+                min_duration=0.3,
+                max_duration=0.8,
+                duration_unit="fraction",
+                p=1
+            )
+        ])
 
     def load_audio_meta(self):
         assert not self.split == "test", "test dataset not implemented"
@@ -125,14 +171,14 @@ class ArtistDataset():
 
             for file in tqdm(glob(os.path.join(base_dir, "*/*/*/", self.audio_name))):
                 # load audio and align
-                waveform, sample_rate = librosa.load(file, sr=None)
+                waveform, sample_rate = librosa.load(file, sr=None, mono=False)
                 waveform = torch.from_numpy(waveform)
                 waveform = F.resample(
                     waveform,
                     orig_freq=sample_rate,
-                    new_freq=self.uni_sample_rate
+                    new_freq=self.target_sr
                 )
-                sample_rate = self.uni_sample_rate
+                sample_rate = self.target_sr
                 # convert to specrogram
                 spec = F.spectrogram(
                     waveform=waveform,
@@ -148,20 +194,14 @@ class ArtistDataset():
                 voice_segments_secs = cut_mute(
                     spec,
                     sample_rate=sample_rate,
-                    hop_size=self.n_fft // 2
+                    hop_size=self.n_fft // 2,
+                    onset_th=self.onset_th,
+                    close_th=self.close_th
                 )
 
                 # ignore audio without voice segments
                 if len(voice_segments_secs) == 0:
                     continue
-
-                # filter the segments that're shoter than 'duration'
-                voice_segments_secs = voice_segments_secs[
-                    (
-                        voice_segments_secs[:, 1] -
-                        voice_segments_secs[:, 0]
-                    ) > self.duration
-                ]
 
                 # save audio metadata for further usage
                 name = file[(len(base_dir) + 1):-(len(self.audio_name) + 1)]
@@ -183,21 +223,23 @@ class ArtistDataset():
             }
 
         # read csv and build label
-        self.singer_label = {}
         with open(os.path.join(self.root_dir, f"{self.split}.txt"), "r") as f:
             csvreader = csv.reader(f)
             for row in csvreader:
-
                 name, singer = row[0], row[1]
                 name = name[:-4]
-                if (not singer in self.singer_label):
-                    self.singer_label[singer] = len(self.singer_label)
                 try:
-                    self.audio_table[name]["label"] = self.singer_label[singer]
+                    self.audio_table[name]["label"] = SingerLabel[singer]
                 except Exception as e:
                     logging.warning(
                         f"Failed to Match Singer & Label.({name}, {e})"
                     )
+
+        # remove audio if not specified by the split file
+        for name in list(self.audio_table.keys()):
+            if (not "label" in self.audio_table[name]):
+                self.audio_table.pop(name)
+
         # build segment list
         self.segment_list = []
         for audio_data in self.audio_table.values():
@@ -214,20 +256,57 @@ class ArtistDataset():
 
         # build auxiliary structures.
         self.stack_video_clips = [0]
+        self.class_samples = [0 for _ in range(self.num_classes)]
         for segment in self.segment_list:
+            clips = segment["clips"]
+            label = segment["data"]["label"]
             self.stack_video_clips.append(
-                self.stack_video_clips[-1] + segment["clips"]
+                self.stack_video_clips[-1] + clips
             )
+            self.class_samples[label] += clips
         self.stack_video_clips.pop(0)
 
     @property
     def num_classes(self):
-        return len(self.singer_label)
+        return len(SingerLabel)
 
     def __len__(self):
         return self.stack_video_clips[-1]
 
     def __getitem__(self, idx):
+        if (self.split == "train"):
+            if (random.random() < 0.5):
+                ######### MIXED ##########
+                data1 = self.getitem(idx)
+                data2 = self.getitem(random.choice(range(len(self))))
+                data1["waveform"] += (
+                    data2["waveform"] / data2["waveform"].max() *
+                    data1["waveform"].max() * 0.5
+                )
+                data1["label"] = (
+                    data1["label"] * 0.7 +
+                    data2["label"] * 0.3
+                )
+                result = data1
+            else:
+                ######### GENERIC ##########
+                result = self.getitem(idx)
+
+            # do augmentation
+            # waveform = self.augmentations(
+            #     samples=result["waveform"],
+            #     sample_rate=result["sr"]
+            # )
+            # result["waveform"] = waveform.copy()
+
+        elif (self.split == "valid"):
+            result = self.getitem(idx)
+        else:
+            raise NotImplementedError()
+
+        return result
+
+    def getitem(self, idx):
         # load segment
         segment_idx, segment_offset, segment_data = self.segment_info(idx)
         # segment & audio attributes
@@ -237,36 +316,27 @@ class ArtistDataset():
             segment_data["start_at"] +
             self.duration * segment_offset
         )
-        ####### TORCH AUDIO #######
-        # audio_sr = torchaudio.info(audio_file,backend="ffmpeg").sample_rate
-        # # derive the audio frame offset
-        # frame_offset = int(audio_offset_sec * audio_sr)
-        # # and the number of frames to retrieve
-        # num_frames = int(self.duration * audio_sr)
-        # # load the audio segment waveform
-        # audio_waveform = torchaudio.load(
-        #     audio_file,
-        #     frame_offset=frame_offset,
-        #     num_frames=num_frames,
-        #     backend="ffmpeg"
-        # )[0]
-        ####### LIBROSA #######
+        # load audio
         audio_waveform, audio_sr = librosa.load(
             audio_file,
-            sr=None,
+            sr=self.target_sr,
             mono=self.mono,
             offset=audio_offset_sec,
             duration=self.duration
         )
-        audio_waveform = torch.from_numpy(audio_waveform)
 
         logging.debug(f"Audio File:{audio_file}")
         logging.debug(f"Audio Label:{audio_label}")
         logging.debug(f"Audio Offset Sec:{audio_offset_sec}")
         logging.debug(f"Audio SR:{audio_sr}")
 
+        label = np.array([
+            (1. if i == audio_label else 0.)
+            for i in range(self.num_classes)
+        ])
+
         return dict(
-            label=audio_label,
+            label=label,
             waveform=audio_waveform,
             sr=audio_sr
         )
@@ -290,14 +360,14 @@ if __name__ == "__main__":
     #     split="train",
     #     audio_name="vocals.mp3",
     #     n_fft=512,
-    #     uni_sample_rate=16000
+    #     target_sr=16000
     # )
     x = ArtistDataset(
         root_dir="dataset",
         split="train",
         audio_name="vocals.mp3",
         n_fft=512,
-        duration=5,
-        uni_sample_rate=16000
+        duration=10,
+        target_sr=16000
     )
-    x[4095]
+    x[4493]

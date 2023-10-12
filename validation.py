@@ -3,6 +3,7 @@ import torch
 import random
 import librosa
 import argparse
+import numpy as np
 import torchaudio.transforms as T
 import torchaudio.functional as F
 
@@ -10,6 +11,8 @@ from glob import glob
 from tqdm import tqdm
 from dts import cut_mute, SingerLabel
 from train import Base, load_singer_anchors, TARGET_SR
+from sklearn.metrics import top_k_accuracy_score
+from sklearn.metrics import confusion_matrix
 N_FFT = 512
 ONSET_TH = 0.1
 CLOSE_TH = 10
@@ -19,25 +22,20 @@ DEVICE = "cuda"
 @torch.inference_mode()
 def main(args):
     # import model & load weights
-    model = Base(
-        len(SingerLabel),
-        load_singer_anchors(
-            args.duration,
-            args.anchor_path
-        )
-    )
+    model = Base(len(SingerLabel), load_singer_anchors(args.duration))
     model.load_state_dict(torch.load(args.weight_path, "cpu"))
     model.eval()
     model.to(DEVICE)
 
-    test_prediction = []
-
+    dataset_labels = []
+    dataset_probs = []
+    dataset_preds = []
     # testing audio file list
     audio_files = sorted(glob(os.path.join(args.root_dir, args.glob_exp)))
 
     for file in tqdm(audio_files):
         # determine the item idx
-        idx = int(file.split('/')[-2])
+        label = file.split('/')[-4]
 
         # find singing segment
         waveform, sample_rate = librosa.load(file, sr=TARGET_SR, mono=False)
@@ -66,6 +64,9 @@ def main(args):
 
         # convert to mono after mute cutting
         waveform = waveform.mean(dim=0)
+
+        if (len(voice_segments_secs) == 0):
+            continue
 
         # concat the singing segments for latter.
         concat_waveform = torch.cat(
@@ -125,38 +126,34 @@ def main(args):
                 )
             logits = torch.cat(logits, dim=0).cpu()
             probs = logits.softmax(dim=-1).mean(dim=0)
-            sorted_classes = probs.sort(descending=True)[1].tolist()
+            dataset_probs.append(probs.flatten().tolist())
+            dataset_labels.append(SingerLabel[label].value)
+            dataset_preds.append(probs.flatten().argmax().item())
 
-        # pick top 3 to output as the result
-        test_prediction.append(
-            ','.join(
-                [str(idx)] +
-                [
-                    SingerLabel(i).name
-                    for i in sorted_classes[:3]
-                ]
-            )
-        )
-    # save the inference results in csv
-    with open(args.out_path, "w") as f:
-        for i in test_prediction:
-            f.write(i + "\n")
+    top1 = top_k_accuracy_score(
+        dataset_labels,
+        dataset_probs,
+        k=1
+    )
+
+    top3 = top_k_accuracy_score(
+        dataset_labels,
+        dataset_probs,
+        k=3
+    )
+
+    conf = confusion_matrix(dataset_labels, dataset_preds)
+    print(top1, top3, conf)
 
 
 # done
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--weight_path", type=str)
-    parser.add_argument("--root_dir", type=str, default="./dataset/test/")
-    parser.add_argument("--glob_exp", type=str, default="*/vocals.mp3")
+    parser.add_argument("--root_dir", type=str, default="./dataset/valid/")
+    parser.add_argument("--glob_exp", type=str, default="*/*/*/vocals.mp3")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--duration", type=int, default=20)
-    parser.add_argument("--out_path", type=str, default="./output.csv")
-    parser.add_argument(
-        "--anchor_path",
-        type=str,
-        default="./singer_samples.pickle"
-    )
     return parser.parse_args()
 
 

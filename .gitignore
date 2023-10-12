@@ -3,3 +3,7 @@ dataset/
 .vscode/
 wandb/
 pretrained_models/
+__pycache__/
+__pycache__
+models/
+*.pickle
